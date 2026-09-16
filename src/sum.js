@@ -11,6 +11,15 @@ export function sum(numbers) {
 }
 
 /**
+ * 计算平均值。
+ * @param {number[]} numbers
+ * @returns {number}
+ */
+export function average(numbers) {
+  return sum(numbers) / numbers.length;
+}
+
+/**
  * 生成发布版本号：主版本 + 构建号。
  * @param {string} version
  * @param {number|string} buildNumber
