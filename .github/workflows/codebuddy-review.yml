@@ -11,31 +11,48 @@ permissions:
 
 jobs:
   ai-review:
-    # 未配置 CODEBUDDY_API_KEY 时跳过，避免 fork PR / 未授权场景直接失败
-    if: ${{ secrets.CODEBUDDY_API_KEY != '' }}
+    # 注意：secrets 上下文不可用于 job 级 if，因此改为在步骤内判断
+    # 未配置 CODEBUDDY_API_KEY 时自动跳过，避免 fork PR / 未授权场景直接失败
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       BASE_REF: ${{ github.base_ref || 'main' }}
     steps:
+      - name: 检查是否启用 AI 审查
+        id: enable
+        env:
+          CODEBUDDY_API_KEY: ${{ secrets.CODEBUDDY_API_KEY }}
+        run: |
+          if [ -n "$CODEBUDDY_API_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "未配置 CODEBUDDY_API_KEY，跳过 AI 代码审查。"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.enable.outputs.enabled == 'true'
         with:
           fetch-depth: 0
 
       - uses: actions/setup-node@v4
+        if: steps.enable.outputs.enabled == 'true'
         with:
           node-version: '20'
 
       - name: 安装 CodeBuddy CLI
+        if: steps.enable.outputs.enabled == 'true'
         run: npm install -g @tencent-ai/codebuddy-code
 
       - name: 生成 PR diff
+        if: steps.enable.outputs.enabled == 'true'
         run: |
           git fetch origin "$BASE_REF" --depth=1
           git diff --unified=5 "origin/$BASE_REF...HEAD" > pr.diff
           wc -l pr.diff
 
       - name: AI 代码审查
+        if: steps.enable.outputs.enabled == 'true'
         env:
           CODEBUDDY_API_KEY: ${{ secrets.CODEBUDDY_API_KEY }}
           # 中国版填 internal；海外版留空；iOA 版填 ioa
@@ -63,7 +80,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 回写 PR 评论
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && steps.enable.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}

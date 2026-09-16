@@ -15,24 +15,40 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # 可选：用 CodeBuddy 自动生成发布说明（未配置密钥时自动跳过）
+  # 注意：secrets 上下文不可用于 job 级 if，因此改为在步骤内判断
+  # 未配置 CODEBUDDY_API_KEY 时自动跳过，不会阻塞后面的构建与部署
   release-notes:
-    if: ${{ secrets.CODEBUDDY_API_KEY != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - name: 检查是否启用 AI 发布说明
+        id: enable
+        env:
+          CODEBUDDY_API_KEY: ${{ secrets.CODEBUDDY_API_KEY }}
+        run: |
+          if [ -n "$CODEBUDDY_API_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "未配置 CODEBUDDY_API_KEY，跳过生成发布说明。"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.enable.outputs.enabled == 'true'
         with:
           fetch-depth: 0
 
       - uses: actions/setup-node@v4
+        if: steps.enable.outputs.enabled == 'true'
         with:
           node-version: '20'
 
       - name: 安装 CodeBuddy CLI
+        if: steps.enable.outputs.enabled == 'true'
         run: npm install -g @tencent-ai/codebuddy-code
 
       - name: 生成发布说明
+        if: steps.enable.outputs.enabled == 'true'
         env:
           CODEBUDDY_API_KEY: ${{ secrets.CODEBUDDY_API_KEY }}
           CODEBUDDY_INTERNET_ENVIRONMENT: ${{ vars.CODEBUDDY_INTERNET_ENVIRONMENT }}
