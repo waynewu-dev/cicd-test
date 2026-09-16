@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+*.log
+.env
+pr.diff
+review.md
+review.err
+release-notes.md
+commits.txt

@@ -1,0 +1,76 @@
+name: CodeBuddy Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ai-review:
+    # 未配置 CODEBUDDY_API_KEY 时跳过，避免 fork PR / 未授权场景直接失败
+    if: ${{ secrets.CODEBUDDY_API_KEY != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BASE_REF: ${{ github.base_ref || 'main' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 安装 CodeBuddy CLI
+        run: npm install -g @tencent-ai/codebuddy-code
+
+      - name: 生成 PR diff
+        run: |
+          git fetch origin "$BASE_REF" --depth=1
+          git diff --unified=5 "origin/$BASE_REF...HEAD" > pr.diff
+          wc -l pr.diff
+
+      - name: AI 代码审查
+        env:
+          CODEBUDDY_API_KEY: ${{ secrets.CODEBUDDY_API_KEY }}
+          # 中国版填 internal；海外版留空；iOA 版填 ioa
+          CODEBUDDY_INTERNET_ENVIRONMENT: ${{ vars.CODEBUDDY_INTERNET_ENVIRONMENT }}
+          CODEBUDDY_RETRY_WATCHDOG: '1'
+          CODEBUDDY_CODE_MAX_TURNS: '20'
+        run: |
+          set -o pipefail
+          PROMPT="$(cat .github/codebuddy/review-prompt.md)"
+          cat pr.diff | codebuddy -p "$PROMPT" \
+            --dangerously-skip-permissions \
+            --allowedTools "Read Grep Glob Bash(git:*)" \
+            > review.md 2>review.err || {
+              echo "CodeBuddy 执行失败，stderr:" && cat review.err && exit 1
+            }
+          cat review.md
+
+      - name: 写入 Job Summary
+        if: always()
+        run: |
+          {
+            echo '## CodeBuddy AI 代码审查'
+            echo
+            cat review.md 2>/dev/null || echo '未生成审查结果。'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 回写 PR 评论
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ ! -s review.md ]; then
+            echo 'CodeBuddy 未返回内容，跳过评论。'
+            exit 0
+          fi
+          gh pr comment "$PR_NUMBER" --body-file review.md

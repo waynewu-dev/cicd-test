@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CodeBuddy CI/CD 测试</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+        background: #0f172a;
+        color: #e2e8f0;
+      }
+      main { text-align: center; padding: 2rem; }
+      h1 { font-size: 2rem; margin-bottom: 0.5rem; }
+      code {
+        background: #1e293b;
+        padding: 0.2rem 0.5rem;
+        border-radius: 4px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>CodeBuddy CI/CD 测试</h1>
+      <p>构建号：<code id="build">加载中…</code></p>
+    </main>
+    <script>
+      fetch('./build.json')
+        .then((r) => r.json())
+        .then((d) => (document.getElementById('build').textContent = d.tag))
+        .catch(() => (document.getElementById('build').textContent = 'local'));
+    </script>
+  </body>
+</html>
