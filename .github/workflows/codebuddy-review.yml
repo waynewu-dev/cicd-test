@@ -61,13 +61,28 @@ jobs:
           CODEBUDDY_CODE_MAX_TURNS: '20'
         run: |
           set -o pipefail
+          codebuddy --version || true
           PROMPT="$(cat .github/codebuddy/review-prompt.md)"
+          set +e
           cat pr.diff | codebuddy -p "$PROMPT" \
             --dangerously-skip-permissions \
             --allowedTools "Read Grep Glob Bash(git:*)" \
-            > review.md 2>review.err || {
-              echo "CodeBuddy 执行失败，stderr:" && cat review.err && exit 1
-            }
+            > review.md 2>review.err
+          EXIT=$?
+          set -e
+          echo "exit code: $EXIT"
+          echo "--- CLI stderr ---"
+          cat review.err
+          echo "--- review.md bytes: $(wc -c < review.md) ---"
+          # 部分版本会把结果打到 stderr，stdout 为空时做兜底
+          if [ ! -s review.md ] && [ -s review.err ]; then
+            echo "stdout 为空，改用 stderr 内容作为审查结果"
+            cp review.err review.md
+          fi
+          if [ ! -s review.md ]; then
+            echo "CodeBuddy 未返回内容。"
+            exit 1
+          fi
           cat review.md
 
       - name: 写入 Job Summary
