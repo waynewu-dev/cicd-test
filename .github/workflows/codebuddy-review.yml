@@ -61,13 +61,24 @@ jobs:
           CODEBUDDY_CODE_MAX_TURNS: '20'
         run: |
           set -o pipefail
+          codebuddy --version || true
           PROMPT="$(cat .github/codebuddy/review-prompt.md)"
+          set +e
           cat pr.diff | codebuddy -p "$PROMPT" \
             --dangerously-skip-permissions \
             --allowedTools "Read Grep Glob Bash(git:*)" \
-            > review.md 2>review.err || {
-              echo "CodeBuddy 执行失败，stderr:" && cat review.err && exit 1
-            }
+            > review.md 2>review.err
+          EXIT=$?
+          set -e
+          echo "exit code: $EXIT"
+          echo "--- CLI stderr（仅诊断用，不作为审查结果）---"
+          # 去掉 ANSI 颜色后输出，日志里更易读
+          sed -r 's/\x1B\[[0-9;]*[mK]//g' review.err || true
+          echo "--- review.md bytes: $(wc -c < review.md) ---"
+          if [ ! -s review.md ]; then
+            echo "CodeBuddy 未返回审查内容，请检查上面对应的密钥与环境配置。"
+            exit 1
+          fi
           cat review.md
 
       - name: 写入 Job Summary
