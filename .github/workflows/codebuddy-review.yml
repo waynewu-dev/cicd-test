@@ -71,16 +71,12 @@ jobs:
           EXIT=$?
           set -e
           echo "exit code: $EXIT"
-          echo "--- CLI stderr ---"
-          cat review.err
+          echo "--- CLI stderr（仅诊断用，不作为审查结果）---"
+          # 去掉 ANSI 颜色后输出，日志里更易读
+          sed -r 's/\x1B\[[0-9;]*[mK]//g' review.err || true
           echo "--- review.md bytes: $(wc -c < review.md) ---"
-          # 部分版本会把结果打到 stderr，stdout 为空时做兜底
-          if [ ! -s review.md ] && [ -s review.err ]; then
-            echo "stdout 为空，改用 stderr 内容作为审查结果"
-            cp review.err review.md
-          fi
           if [ ! -s review.md ]; then
-            echo "CodeBuddy 未返回内容。"
+            echo "CodeBuddy 未返回审查内容，请检查上面对应的密钥与环境配置。"
             exit 1
           fi
           cat review.md
