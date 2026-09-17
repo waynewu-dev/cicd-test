@@ -1,9 +1,12 @@
 name: CodeBuddy Issue Assistant
 
-# 新建/重开 Issue 时自动用 AI 分析并回复；也可手动指定编号触发
+# 新建/重开 Issue 时自动用 AI 分析并回复；
+# 在 Issue 评论里 @codebuddy 也会触发；也可手动指定编号触发
 on:
   issues:
     types: [opened, reopened]
+  issue_comment:
+    types: [created]
   workflow_dispatch:
     inputs:
       issue_number:
@@ -16,6 +19,10 @@ permissions:
 
 jobs:
   ai-issue:
+    # 仅处理：新建/重开 Issue、或评论里含 @codebuddy 的 Issue 评论（排除 PR 评论）
+    if: >
+      github.event_name != 'issue_comment' ||
+      (contains(github.event.comment.body, '@codebuddy') && !github.event.issue.pull_request)
     # 注意：secrets 上下文不可用于 job 级 if，因此改为在步骤内判断
     # 未配置 CODEBUDDY_API_KEY 时自动跳过，不消耗 Actions 时长
     runs-on: ubuntu-latest
@@ -57,6 +64,7 @@ jobs:
           ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_BODY: ${{ github.event.issue.body }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           # 手动触发（workflow_dispatch）时事件里没有 Issue 数据，改用 gh 读取
           if [ -z "$ISSUE_TITLE" ]; then
@@ -69,6 +77,9 @@ jobs:
             cat .github/codebuddy/issue-prompt.md
             printf '\n\n---\n\n## Issue #%s\n\n**标题**：%s\n\n**正文**：\n\n%s\n' \
               "$ISSUE_NUMBER" "$ISSUE_TITLE" "$ISSUE_BODY"
+            if [ -n "$COMMENT_BODY" ]; then
+              printf '\n\n**触发评论（@codebuddy）**：\n\n%s\n' "$COMMENT_BODY"
+            fi
           } > full-prompt.md
 
           set +e

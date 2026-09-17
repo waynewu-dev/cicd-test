@@ -45,14 +45,31 @@ jobs:
         run: npm install -g @tencent-ai/codebuddy-code
 
       - name: 生成 PR diff
+        id: diff
         if: steps.enable.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          git fetch origin "$BASE_REF" --depth=1
-          git diff --unified=5 "origin/$BASE_REF...HEAD" > pr.diff
+          if [ -n "$PR_NUMBER" ]; then
+            # 用 gh 直接从 API 取 diff，最可靠（不受浅克隆/远程追踪引用影响）
+            gh pr diff "$PR_NUMBER" > pr.diff
+          else
+            # workflow_dispatch 手动触发时没有 PR 上下文，退回与默认分支比较
+            git fetch origin "$BASE_REF" --depth=1
+            git diff --unified=5 "FETCH_HEAD...HEAD" > pr.diff
+          fi
           wc -l pr.diff
+          if [ ! -s pr.diff ]; then
+            echo "::warning::本次未取到任何 diff，跳过审查（PR 可能已合入或内容为空）。"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: AI 代码审查
-        if: steps.enable.outputs.enabled == 'true'
+        if: steps.enable.outputs.enabled == 'true' && steps.diff.outputs.skip != 'true'
         env:
           CODEBUDDY_API_KEY: ${{ secrets.CODEBUDDY_API_KEY }}
           # 中国版填 internal；海外版留空；iOA 版填 ioa
@@ -91,7 +108,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 回写 PR 评论
-        if: github.event_name == 'pull_request' && steps.enable.outputs.enabled == 'true'
+        if: github.event_name == 'pull_request' && steps.enable.outputs.enabled == 'true' && steps.diff.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
