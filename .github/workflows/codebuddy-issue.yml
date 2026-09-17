@@ -21,8 +21,9 @@ on:
   workflow_dispatch:
     inputs:
       issue_number:
-        description: 要处理的 Issue / PR 编号
-        required: true
+        # 留空则执行下面的兜底作业（扫描并回答未回复的行内 @codebuddy 提问）
+        description: 要处理的 Issue / PR 编号（留空=轮询 PR 行内提问）
+        required: false
 
 permissions:
   contents: read
@@ -31,6 +32,9 @@ permissions:
 
 jobs:
   ai-assistant:
+    # 事件驱动：Issue / 评论；手动触发且填了编号时走这里
+    if: >
+      github.event_name != 'schedule' && inputs.issue_number != ''
     # 注意：secrets 上下文不可用于 job 级 if，因此密钥判断放在步骤内
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -217,7 +221,8 @@ jobs:
   # 兜底作业：定时扫描所有开放 PR 的行内评论，
   # 找出未被回复的 @codebuddy 提问并作答（应对 review 类事件未派发到 Actions 的情况）
   ai-pr-mentions:
-    if: github.event_name == 'schedule'
+    # 定时触发，或手动触发但未填编号时执行
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.issue_number == '')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
