@@ -14,6 +14,10 @@ on:
     types: [created]
   pull_request_review:
     types: [submitted]
+  # 兜底：部分仓库/场景下 review 类事件不会派发到 Actions，
+  # 因此每 5 分钟扫描一次未获回复的行内 @codebuddy 提问
+  schedule:
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       issue_number:
@@ -198,8 +202,130 @@ jobs:
             exit 1
           fi
 
+          # 带上标记，便于定时任务识别“该提问已被回复”，避免重复回答
+          {
+            printf '<!-- codebuddy-answer -->\n\n'
+            cat reply.md
+          } > answer.md
+
           if [ "$IS_PR" = "true" ]; then
-            gh pr comment "$N" --body-file reply.md
+            gh pr comment "$N" --body-file answer.md
           else
-            gh issue comment "$N" --body-file reply.md
+            gh issue comment "$N" --body-file answer.md
           fi
+
+  # 兜底作业：定时扫描所有开放 PR 的行内评论，
+  # 找出未被回复的 @codebuddy 提问并作答（应对 review 类事件未派发到 Actions 的情况）
+  ai-pr-mentions:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: 检查是否启用 AI
+        id: enable
+        env:
+          CODEBUDDY_API_KEY: ${{ secrets.CODEBUDDY_API_KEY }}
+        run: |
+          if [ -n "$CODEBUDDY_API_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "未配置 CODEBUDDY_API_KEY，跳过轮询。"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.enable.outputs.enabled == 'true'
+
+      - uses: actions/setup-node@v4
+        if: steps.enable.outputs.enabled == 'true'
+        with:
+          node-version: '20'
+
+      - name: 安装 CodeBuddy CLI
+        if: steps.enable.outputs.enabled == 'true'
+        run: npm install -g @tencent-ai/codebuddy-code
+
+      - name: 扫描并回答未回复的 @codebuddy 提问
+        if: steps.enable.outputs.enabled == 'true'
+        env:
+          CODEBUDDY_API_KEY: ${{ secrets.CODEBUDDY_API_KEY }}
+          CODEBUDDY_INTERNET_ENVIRONMENT: ${{ vars.CODEBUDDY_INTERNET_ENVIRONMENT }}
+          CODEBUDDY_RETRY_WATCHDOG: '1'
+          CODEBUDDY_CODE_MAX_TURNS: '20'
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          MARK='<!-- codebuddy-answer -->'
+          HANDLED=0
+
+          for N in $(gh pr list --state open --json number --jq '.[].number'); do
+            gh api --paginate "repos/$GH_REPO/pulls/$N/comments" > "rc_$N.json"
+            HIT=$(jq -c '[.[] | select(.body | contains("@codebuddy"))] | last' "rc_$N.json")
+
+            if [ -z "$HIT" ] || [ "$HIT" = "null" ]; then
+              echo "PR #$N：无行内 @codebuddy 提问，跳过。"
+              continue
+            fi
+
+            CTIME=$(printf '%s' "$HIT" | jq -r '.created_at')
+            QBODY=$(printf '%s' "$HIT" | jq -r '.body')
+            QPATH=$(printf '%s' "$HIT" | jq -r '.path')
+            QLINE=$(printf '%s' "$HIT" | jq -r '.line // .original_line')
+
+            # 该提问之后若已有带标记的机器人回复，则认为已处理
+            gh api --paginate "repos/$GH_REPO/issues/$N/comments" > "ic_$N.json"
+            ANSWERED=$(jq -r --arg t "$CTIME" --arg m "$MARK" \
+              '[.[] | select(.created_at > $t) | select(.user.login == "github-actions[bot]") | select(.body | contains($m))] | length' \
+              "ic_$N.json")
+
+            if [ "$ANSWERED" != "0" ]; then
+              echo "PR #$N：已有回复，跳过。"
+              continue
+            fi
+
+            echo "PR #$N：发现未回复的 @codebuddy 提问（$QPATH:$QLINE），开始作答。"
+            gh pr view "$N" --json title,body > pr_meta.json
+            TITLE=$(jq -r '.title' pr_meta.json)
+            BODY=$(jq -r '.body' pr_meta.json)
+            gh pr diff "$N" > target.diff
+
+            {
+              cat .github/codebuddy/review-prompt.md
+              printf '\n追加问题（@codebuddy，位于 `%s` 第 %s 行）：\n\n%s\n\n' \
+                "$QPATH" "$QLINE" "$QBODY"
+              printf '## PR #%s\n\n**标题**：%s\n\n**正文**：\n\n%s\n\ndiff 如下：\n\n' \
+                "$N" "$TITLE" "$BODY"
+              cat target.diff
+            } > full-prompt.md
+
+            set +e
+            cat full-prompt.md | codebuddy -p \
+              "请严格按输入中的输出要求审查该 PR，并重点回答其中的“追加问题”，只输出最终答复文本。" \
+              --dangerously-skip-permissions \
+              --allowedTools "Read Grep Glob Bash(git:*)" \
+              > reply.md 2>reply.err
+            EXIT=$?
+            set -e
+
+            echo "exit code: $EXIT"
+            sed -r 's/\x1B\[[0-9;]*[mK]//g' reply.err || true
+            echo "--- reply.md bytes: $(wc -c < reply.md) ---"
+
+            if [ ! -s reply.md ]; then
+              echo "CodeBuddy 未返回内容，保留提问待下次轮询。"
+              continue
+            fi
+
+            {
+              printf '%s\n\n' "$MARK"
+              cat reply.md
+            } > answer.md
+
+            gh pr comment "$N" --body-file answer.md
+            echo "PR #$N：已回复。"
+            HANDLED=1
+            # 每次轮询只处理一个提问，避免超出作业时限
+            break
+          done
+
+          echo "本次轮询处理数量：$HANDLED"
