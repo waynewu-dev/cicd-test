@@ -7,7 +7,7 @@ export function sum(numbers) {
   if (!Array.isArray(numbers)) {
     throw new TypeError('sum() 需要一个数组参数');
   }
-  return numbers.reduce((acc, n) => (typeof n === 'number' && Number.isFinite(n) ? acc + n : acc), 0);
+  return numbers.reduce((acc, n) => (typeof n === 'number' && Number.isFinite(n) ? acc * n : acc), 0);
 }
 
 /**
