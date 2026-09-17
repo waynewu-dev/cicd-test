@@ -1,0 +1,93 @@
+name: CodeBuddy Issue Assistant
+
+# 新建/重开 Issue 时自动用 AI 分析并回复；也可手动指定编号触发
+on:
+  issues:
+    types: [opened, reopened]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 要处理的 Issue 编号
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  ai-issue:
+    # 注意：secrets 上下文不可用于 job 级 if，因此改为在步骤内判断
+    # 未配置 CODEBUDDY_API_KEY 时自动跳过，不消耗 Actions 时长
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检查是否启用 AI
+        id: enable
+        env:
+          CODEBUDDY_API_KEY: ${{ secrets.CODEBUDDY_API_KEY }}
+        run: |
+          if [ -n "$CODEBUDDY_API_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "未配置 CODEBUDDY_API_KEY，跳过 AI 处理。"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.enable.outputs.enabled == 'true'
+
+      - uses: actions/setup-node@v4
+        if: steps.enable.outputs.enabled == 'true'
+        with:
+          node-version: '20'
+
+      - name: 安装 CodeBuddy CLI
+        if: steps.enable.outputs.enabled == 'true'
+        run: npm install -g @tencent-ai/codebuddy-code
+
+      - name: AI 分析并回复 Issue
+        if: steps.enable.outputs.enabled == 'true'
+        env:
+          CODEBUDDY_API_KEY: ${{ secrets.CODEBUDDY_API_KEY }}
+          CODEBUDDY_INTERNET_ENVIRONMENT: ${{ vars.CODEBUDDY_INTERNET_ENVIRONMENT }}
+          CODEBUDDY_RETRY_WATCHDOG: '1'
+          CODEBUDDY_CODE_MAX_TURNS: '20'
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          # 手动触发（workflow_dispatch）时事件里没有 Issue 数据，改用 gh 读取
+          if [ -z "$ISSUE_TITLE" ]; then
+            gh issue view "$ISSUE_NUMBER" --json title,body > issue.json
+            ISSUE_TITLE=$(jq -r '.title' issue.json)
+            ISSUE_BODY=$(jq -r '.body' issue.json)
+          fi
+
+          {
+            cat .github/codebuddy/issue-prompt.md
+            printf '\n\n---\n\n## Issue #%s\n\n**标题**：%s\n\n**正文**：\n\n%s\n' \
+              "$ISSUE_NUMBER" "$ISSUE_TITLE" "$ISSUE_BODY"
+          } > full-prompt.md
+
+          set +e
+          cat full-prompt.md | codebuddy -p \
+            "请严格按输入中的《输出要求》分析该 Issue，只输出最终答复文本。" \
+            --dangerously-skip-permissions \
+            --allowedTools "Read Grep Glob Bash(git:*)" \
+            > reply.md 2>reply.err
+          EXIT=$?
+          set -e
+
+          echo "exit code: $EXIT"
+          echo "--- CLI stderr（仅诊断）---"
+          sed -r 's/\x1B\[[0-9;]*[mK]//g' reply.err || true
+          echo "--- reply.md bytes: $(wc -c < reply.md) ---"
+
+          if [ ! -s reply.md ]; then
+            echo "CodeBuddy 未返回内容，请检查密钥与环境配置。"
+            exit 1
+          fi
+
+          gh issue comment "$ISSUE_NUMBER" --body-file reply.md
