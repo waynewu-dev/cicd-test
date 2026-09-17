@@ -1,28 +1,32 @@
 name: CodeBuddy Issue Assistant
 
 # 新建/重开 Issue 时自动用 AI 分析并回复；
-# 在 Issue 评论里 @codebuddy 也会触发；也可手动指定编号触发
+# 在 Issue 或 PR 的评论（含行内评论）里 @codebuddy 也会触发；也可手动指定编号触发
 on:
   issues:
     types: [opened, reopened]
   issue_comment:
     types: [created]
+  pull_request_review_comment:
+    types: [created]
   workflow_dispatch:
     inputs:
       issue_number:
-        description: 要处理的 Issue 编号
+        description: 要处理的 Issue / PR 编号
         required: true
 
 permissions:
   contents: read
   issues: write
+  pull-requests: write
 
 jobs:
   ai-issue:
-    # 仅处理：新建/重开 Issue、或评论里含 @codebuddy 的 Issue 评论（排除 PR 评论）
+    # 处理：新建/重开 Issue、手动触发、或评论正文含 @codebuddy 的评论
+    # （issue_comment 覆盖 Issue 与 PR 会话评论，pull_request_review_comment 覆盖 PR 行内评论）
     if: >
-      github.event_name != 'issue_comment' ||
-      (contains(github.event.comment.body, '@codebuddy') && !github.event.issue.pull_request)
+      (github.event_name != 'issue_comment' && github.event_name != 'pull_request_review_comment')
+      || contains(github.event.comment.body, '@codebuddy')
     # 注意：secrets 上下文不可用于 job 级 if，因此改为在步骤内判断
     # 未配置 CODEBUDDY_API_KEY 时自动跳过，不消耗 Actions 时长
     runs-on: ubuntu-latest
@@ -52,7 +56,7 @@ jobs:
         if: steps.enable.outputs.enabled == 'true'
         run: npm install -g @tencent-ai/codebuddy-code
 
-      - name: AI 分析并回复 Issue
+      - name: AI 分析并回复
         if: steps.enable.outputs.enabled == 'true'
         env:
           CODEBUDDY_API_KEY: ${{ secrets.CODEBUDDY_API_KEY }}
@@ -61,30 +65,72 @@ jobs:
           CODEBUDDY_CODE_MAX_TURNS: '20'
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
+          # 目标编号：PR 行内评论 / Issue(含 PR 会话评论) / 手动输入
+          TARGET_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.issue_number }}
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_BODY: ${{ github.event.issue.body }}
           COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_PATH: ${{ github.event.comment.path }}
+          COMMENT_LINE: ${{ github.event.comment.line || github.event.comment.original_line }}
+          # PR 行内评论，或 issue_comment 落在 PR 上时，按 PR 场景处理
+          IS_PR: ${{ github.event_name == 'pull_request_review_comment' || github.event.issue.pull_request != null }}
         run: |
-          # 手动触发（workflow_dispatch）时事件里没有 Issue 数据，改用 gh 读取
-          if [ -z "$ISSUE_TITLE" ]; then
-            gh issue view "$ISSUE_NUMBER" --json title,body > issue.json
-            ISSUE_TITLE=$(jq -r '.title' issue.json)
-            ISSUE_BODY=$(jq -r '.body' issue.json)
+          N="$TARGET_NUMBER"
+
+          # 手动触发时若填的是 PR 编号，自动识别为 PR 场景（Issue 与 PR 共用编号空间）
+          if [ "$IS_PR" != "true" ] && gh pr view "$N" >/dev/null 2>&1; then
+            IS_PR="true"
           fi
 
-          {
-            cat .github/codebuddy/issue-prompt.md
-            printf '\n\n---\n\n## Issue #%s\n\n**标题**：%s\n\n**正文**：\n\n%s\n' \
-              "$ISSUE_NUMBER" "$ISSUE_TITLE" "$ISSUE_BODY"
-            if [ -n "$COMMENT_BODY" ]; then
-              printf '\n\n**触发评论（@codebuddy）**：\n\n%s\n' "$COMMENT_BODY"
+          if [ "$IS_PR" = "true" ]; then
+            # ---- PR 场景：带上 PR 元信息 + diff，复用代码审查提示词 ----
+            gh pr view "$N" --json title,body > target.json
+            TITLE=$(jq -r '.title' target.json)
+            BODY=$(jq -r '.body' target.json)
+            gh pr diff "$N" > target.diff
+
+            {
+              cat .github/codebuddy/review-prompt.md
+              if [ -n "$COMMENT_PATH" ]; then
+                printf '\n追加问题（@codebuddy，位于 `%s` 第 %s 行）：\n\n%s\n\n' \
+                  "$COMMENT_PATH" "$COMMENT_LINE" "$COMMENT_BODY"
+              else
+                printf '\n追加问题（@codebuddy）：\n\n%s\n\n' "$COMMENT_BODY"
+              fi
+              printf '## PR #%s\n\n**标题**：%s\n\n**正文**：\n\n%s\n\ndiff 如下：\n\n' \
+                "$N" "$TITLE" "$BODY"
+              cat target.diff
+            } > full-prompt.md
+
+            INSTRUCTION="请严格按输入中的输出要求审查该 PR，并重点回答其中的“追加问题”，只输出最终答复文本。"
+          else
+            # ---- Issue 场景 ----
+            # 手动触发（workflow_dispatch）时事件里没有 Issue 数据，改用 gh 读取
+            if [ -n "$ISSUE_TITLE" ]; then
+              TITLE="$ISSUE_TITLE"
+              BODY="$ISSUE_BODY"
+            else
+              gh issue view "$N" --json title,body > target.json
+              TITLE=$(jq -r '.title' target.json)
+              BODY=$(jq -r '.body' target.json)
             fi
-          } > full-prompt.md
+
+            {
+              cat .github/codebuddy/issue-prompt.md
+              printf '\n\n---\n\n## Issue #%s\n\n**标题**：%s\n\n**正文**：\n\n%s\n' \
+                "$N" "$TITLE" "$BODY"
+              if [ -n "$COMMENT_BODY" ]; then
+                printf '\n\n**触发评论（@codebuddy）**：\n\n%s\n' "$COMMENT_BODY"
+              fi
+            } > full-prompt.md
+
+            INSTRUCTION="请严格按输入中的《输出要求》分析该 Issue，只输出最终答复文本。"
+          fi
+
+          echo "--- prompt bytes: $(wc -c < full-prompt.md) ---"
 
           set +e
-          cat full-prompt.md | codebuddy -p \
-            "请严格按输入中的《输出要求》分析该 Issue，只输出最终答复文本。" \
+          cat full-prompt.md | codebuddy -p "$INSTRUCTION" \
             --dangerously-skip-permissions \
             --allowedTools "Read Grep Glob Bash(git:*)" \
             > reply.md 2>reply.err
@@ -101,4 +147,8 @@ jobs:
             exit 1
           fi
 
-          gh issue comment "$ISSUE_NUMBER" --body-file reply.md
+          if [ "$IS_PR" = "true" ]; then
+            gh pr comment "$N" --body-file reply.md
+          else
+            gh issue comment "$N" --body-file reply.md
+          fi
