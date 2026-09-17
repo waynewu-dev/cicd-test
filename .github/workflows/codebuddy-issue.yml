@@ -1,7 +1,10 @@
-name: CodeBuddy Issue Assistant
+name: CodeBuddy Issue / PR Assistant
 
-# 新建/重开 Issue 时自动用 AI 分析并回复；
-# 在 Issue 或 PR 的评论（含行内评论）里 @codebuddy 也会触发；也可手动指定编号触发
+# 支持的触发方式：
+#   1. 新建 / 重开 Issue：自动 AI 分析并回复
+#   2. Issue 或 PR 会话评论里 @codebuddy：按追问回复
+#   3. PR 行内评论（单条评论或随 review 一起提交）里 @codebuddy：带 diff 回答
+#   4. 手动指定 Issue / PR 编号触发
 on:
   issues:
     types: [opened, reopened]
@@ -9,6 +12,8 @@ on:
     types: [created]
   pull_request_review_comment:
     types: [created]
+  pull_request_review:
+    types: [submitted]
   workflow_dispatch:
     inputs:
       issue_number:
@@ -21,19 +26,72 @@ permissions:
   pull-requests: write
 
 jobs:
-  ai-issue:
-    # 处理：新建/重开 Issue、手动触发、或评论正文含 @codebuddy 的评论
-    # （issue_comment 覆盖 Issue 与 PR 会话评论，pull_request_review_comment 覆盖 PR 行内评论）
-    if: >
-      (github.event_name != 'issue_comment' && github.event_name != 'pull_request_review_comment')
-      || contains(github.event.comment.body, '@codebuddy')
-    # 注意：secrets 上下文不可用于 job 级 if，因此改为在步骤内判断
-    # 未配置 CODEBUDDY_API_KEY 时自动跳过，不消耗 Actions 时长
+  ai-assistant:
+    # 注意：secrets 上下文不可用于 job 级 if，因此密钥判断放在步骤内
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      - name: 解析触发来源（是否含 @codebuddy / 是否 PR 场景）
+        id: ctx
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          TARGET_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.issue_number }}
+          REVIEW_ID: ${{ github.event.review.id }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_PATH: ${{ github.event.comment.path }}
+          COMMENT_LINE: ${{ github.event.comment.line || github.event.comment.original_line }}
+          # 是否为 PR 场景：PR 行内评论 / PR review / 落在 PR 上的会话评论
+          IS_PR_EXPR: ${{ github.event_name == 'pull_request_review_comment' || github.event_name == 'pull_request_review' || github.event.issue.pull_request != null }}
+        run: |
+          N="$TARGET_NUMBER"
+          IS_PR="$IS_PR_EXPR"
+          BODY="$COMMENT_BODY"
+          PATH_V="$COMMENT_PATH"
+          LINE_V="$COMMENT_LINE"
+          TRIGGERED="false"
+
+          # 手动触发时若填的是 PR 编号，自动识别为 PR 场景（Issue 与 PR 共用编号空间）
+          if [ "$EVENT" = "workflow_dispatch" ] && gh pr view "$N" >/dev/null 2>&1; then
+            IS_PR="true"
+          fi
+
+          if [ "$EVENT" = "issues" ] || [ "$EVENT" = "workflow_dispatch" ]; then
+            TRIGGERED="true"
+          elif printf '%s' "$BODY" | grep -q '@codebuddy'; then
+            TRIGGERED="true"
+          elif [ -n "$REVIEW_ID" ]; then
+            # review 提交时，行内评论不在事件正文里，需按 review 拉取
+            gh api "repos/$GH_REPO/pulls/$N/reviews/$REVIEW_ID/comments" > rc.json
+            HIT=$(jq -c '[.[] | select(.body | test("@codebuddy"))] | last' rc.json)
+            if [ -n "$HIT" ] && [ "$HIT" != "null" ]; then
+              TRIGGERED="true"
+              IS_PR="true"
+              BODY=$(printf '%s' "$HIT" | jq -r '.body')
+              PATH_V=$(printf '%s' "$HIT" | jq -r '.path')
+              LINE_V=$(printf '%s' "$HIT" | jq -r '.line // .original_line')
+            fi
+          fi
+
+          echo "event=$EVENT, target=#$N, is_pr=$IS_PR, triggered=$TRIGGERED"
+          if [ "$TRIGGERED" != "true" ]; then
+            echo "评论中未检测到 @codebuddy，跳过。"
+          fi
+
+          {
+            echo "triggered=$TRIGGERED"
+            echo "is_pr=$IS_PR"
+            echo "body<<CB_BODY_EOF"
+            printf '%s\n' "$BODY"
+            echo "CB_BODY_EOF"
+            echo "path=$PATH_V"
+            echo "line=$LINE_V"
+          } >> "$GITHUB_OUTPUT"
+
       - name: 检查是否启用 AI
         id: enable
+        if: steps.ctx.outputs.triggered == 'true'
         env:
           CODEBUDDY_API_KEY: ${{ secrets.CODEBUDDY_API_KEY }}
         run: |
@@ -45,19 +103,19 @@ jobs:
           fi
 
       - uses: actions/checkout@v4
-        if: steps.enable.outputs.enabled == 'true'
+        if: steps.ctx.outputs.triggered == 'true' && steps.enable.outputs.enabled == 'true'
 
       - uses: actions/setup-node@v4
-        if: steps.enable.outputs.enabled == 'true'
+        if: steps.ctx.outputs.triggered == 'true' && steps.enable.outputs.enabled == 'true'
         with:
           node-version: '20'
 
       - name: 安装 CodeBuddy CLI
-        if: steps.enable.outputs.enabled == 'true'
+        if: steps.ctx.outputs.triggered == 'true' && steps.enable.outputs.enabled == 'true'
         run: npm install -g @tencent-ai/codebuddy-code
 
       - name: AI 分析并回复
-        if: steps.enable.outputs.enabled == 'true'
+        if: steps.ctx.outputs.triggered == 'true' && steps.enable.outputs.enabled == 'true'
         env:
           CODEBUDDY_API_KEY: ${{ secrets.CODEBUDDY_API_KEY }}
           CODEBUDDY_INTERNET_ENVIRONMENT: ${{ vars.CODEBUDDY_INTERNET_ENVIRONMENT }}
@@ -65,22 +123,15 @@ jobs:
           CODEBUDDY_CODE_MAX_TURNS: '20'
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          # 目标编号：PR 行内评论 / Issue(含 PR 会话评论) / 手动输入
           TARGET_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.issue_number }}
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_BODY: ${{ github.event.issue.body }}
-          COMMENT_BODY: ${{ github.event.comment.body }}
-          COMMENT_PATH: ${{ github.event.comment.path }}
-          COMMENT_LINE: ${{ github.event.comment.line || github.event.comment.original_line }}
-          # PR 行内评论，或 issue_comment 落在 PR 上时，按 PR 场景处理
-          IS_PR: ${{ github.event_name == 'pull_request_review_comment' || github.event.issue.pull_request != null }}
+          COMMENT_BODY: ${{ steps.ctx.outputs.body }}
+          COMMENT_PATH: ${{ steps.ctx.outputs.path }}
+          COMMENT_LINE: ${{ steps.ctx.outputs.line }}
+          IS_PR: ${{ steps.ctx.outputs.is_pr }}
         run: |
           N="$TARGET_NUMBER"
-
-          # 手动触发时若填的是 PR 编号，自动识别为 PR 场景（Issue 与 PR 共用编号空间）
-          if [ "$IS_PR" != "true" ] && gh pr view "$N" >/dev/null 2>&1; then
-            IS_PR="true"
-          fi
 
           if [ "$IS_PR" = "true" ]; then
             # ---- PR 场景：带上 PR 元信息 + diff，复用代码审查提示词 ----
